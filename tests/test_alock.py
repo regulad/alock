@@ -37,7 +37,9 @@ class Lab:
     """A temporary home with its own git config, an origin, and clones."""
 
     def __init__(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="alock-test-"))
+        # Resolved, as git reports paths: macOS's temporary directory is under
+        # /var, a symlink to /private/var.
+        self.dir = Path(tempfile.mkdtemp(prefix="alock-test-")).resolve()
         self.log = self.dir / "stub.log"
         self.log.touch()
         gitconfig = self.dir / "gitconfig"
