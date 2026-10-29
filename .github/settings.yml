@@ -1,0 +1,17 @@
+# Repository settings, applied by the Probot "Settings" app.
+# https://github.com/repository-settings/app
+
+repository:
+  name: alock
+  description: "Claude Code plugin that locks OpenTofu, Terraform and Ansible applies so parallel agents can't overlap or undo each other"
+  topics: claude-code, claude-code-plugin, ai-agents, multi-agent, opentofu, terraform, ansible, infrastructure-as-code, locking, git-worktree, git-lfs
+
+  private: false
+
+  has_issues: true
+  has_projects: false
+  has_wiki: false
+  has_downloads: false
+  has_discussions: false
+
+  default_branch: master

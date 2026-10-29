@@ -1,0 +1,24 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "alock",
+  "version": "0.1.0",
+  "description": "Locks OpenTofu, Terraform and Ansible applies so parallel agents can't overlap or undo each other",
+  "author": {
+    "name": "Parker Wahle",
+    "email": "regulad@regulad.xyz"
+  },
+  "homepage": "https://github.com/regulad/alock",
+  "repository": "https://github.com/regulad/alock",
+  "license": "AGPL-3.0-or-later",
+  "keywords": ["opentofu", "terraform", "ansible", "locking", "git-worktree", "multi-agent"],
+  "userConfig": {
+    "lock_timeout": {
+      "type": "number",
+      "title": "Lock timeout",
+      "description": "Seconds a tofu, terraform or ansible-playbook change waits for its locks before it fails, telling the agent who holds them",
+      "default": 60,
+      "min": 0,
+      "max": 3600
+    }
+  }
+}

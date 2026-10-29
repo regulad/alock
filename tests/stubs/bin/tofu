@@ -1,0 +1,6 @@
+#!/bin/sh
+# A stand-in for tofu and terraform: logs its call, sleeps $STUB_SLEEP, exits $STUB_EXIT.
+echo "${0##*/} $* pid=$$" >> "$STUB_LOG"
+if [ -n "${STUB_SLEEP:-}" ]; then sleep "$STUB_SLEEP"; fi
+echo "${0##*/} done" >> "$STUB_LOG"
+exit "${STUB_EXIT:-0}"

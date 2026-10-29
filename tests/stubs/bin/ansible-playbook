@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""A stand-in for ansible-playbook. With --list-hosts it prints the hosts of
+--limit, or else $STUB_HOSTS, the way the real one does; otherwise it logs its
+call and sleeps $STUB_SLEEP."""
+
+import os
+import sys
+import time
+
+args = sys.argv[1:]
+# Like the real one, refuse non-blocking handles.
+blocked = [str(fd) for fd in (0, 1, 2) if not os.get_blocking(fd)]
+if blocked:
+    sys.exit(f"ERROR: Ansible requires blocking IO. Non-blocking: {', '.join(blocked)}")
+if "--list-hosts" in args:
+    hosts = os.environ.get("STUB_HOSTS", "")
+    for i, arg in enumerate(args):
+        if arg in ("-l", "--limit") and i + 1 < len(args):
+            hosts = args[i + 1]
+        elif arg.startswith("--limit="):
+            hosts = arg.split("=", 1)[1]
+    names = [h for h in hosts.split(",") if h]
+    print("\nplaybook: site.yml\n")
+    print(f"  play #1 (all): Site\tTAGS: []\n    pattern: ['all']\n    hosts ({len(names)}):")
+    for name in names:
+        print(f"      {name}")
+    print()
+    sys.exit(0)
+with open(os.environ["STUB_LOG"], "a") as log:
+    log.write(f"ansible-playbook {' '.join(args)} pid={os.getpid()}\n")
+time.sleep(float(os.environ.get("STUB_SLEEP") or 0))
+with open(os.environ["STUB_LOG"], "a") as log:
+    log.write("ansible-playbook done\n")
+sys.exit(int(os.environ.get("STUB_EXIT", "0")))

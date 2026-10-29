@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""A stand-in for ansible-inventory --list: the hosts in $STUB_INV_HOSTS."""
+
+import json
+import os
+
+hosts = [h for h in os.environ.get("STUB_INV_HOSTS", "").split(",") if h]
+print(json.dumps({
+    "_meta": {"hostvars": {h: {} for h in hosts}},
+    "all": {"children": ["ungrouped"]},
+    "ungrouped": {"hosts": hosts},
+}))

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "alock",
+  "description": "alock's own marketplace: one plugin that locks OpenTofu, Terraform and Ansible applies for parallel agents",
+  "owner": {
+    "name": "Parker Wahle",
+    "email": "regulad@regulad.xyz"
+  },
+  "plugins": [
+    {
+      "name": "alock",
+      "source": "./",
+      "description": "Locks OpenTofu, Terraform and Ansible applies so parallel agents can't overlap or undo each other"
+    }
+  ]
+}

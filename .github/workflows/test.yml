@@ -1,0 +1,24 @@
+# Runs alock's end-to-end tests. They need only git and Python: tofu, Ansible
+# and git-lfs are stubbed, so nothing real is touched.
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Versions
+        run: git --version && python3 --version
+      - name: Test
+        run: python3 -W error::ResourceWarning -m unittest discover -s tests -v

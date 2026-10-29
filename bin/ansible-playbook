@@ -1,0 +1,5 @@
+#!/bin/sh
+# alock's shim. It runs the real binary of the same name, the first one on PATH
+# after this directory, and locks what a changing call changes. See DESIGN.md.
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+exec python3 -I "$here/../libexec/shim.py" "${0##*/}" "$@"
