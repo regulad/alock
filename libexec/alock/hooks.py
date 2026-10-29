@@ -37,6 +37,11 @@ def env_lines(session_id: str, timeout: str) -> str:
         # The shims must come before the real binaries: put their directory
         # first unless it already is.
         f'case ":$PATH:" in ":"{bin_dir}":"*) ;; *) PATH={bin_dir}":$PATH"; export PATH ;; esac\n'
+        # Git copies these notes onto a commit's rewrites, so a rebased or
+        # amended apply stays linked to the commit it came from.
+        f'case ":${{GIT_NOTES_REWRITE_REF-}}:" in *":{records.NOTES_REF}:"*) ;; '
+        f'*) GIT_NOTES_REWRITE_REF="{records.NOTES_REF}${{GIT_NOTES_REWRITE_REF:+:$GIT_NOTES_REWRITE_REF}}"; '
+        "export GIT_NOTES_REWRITE_REF ;; esac\n"
     )
 
 
@@ -97,8 +102,9 @@ def status(repo: Repo) -> str:
         f"alock is on in {repo.top}, in {repo.mode} mode. tofu, terraform and "
         "ansible-playbook changes there lock their targets and check their records; "
         "commit on your worktree branch before applying. An apply is refused when "
-        "HEAD lacks the commit last applied to a target. To roll a target back, git "
-        "revert the applied commit on a branch that contains it and apply the revert; "
+        "HEAD lacks the commit last applied to a target. Rebasing or amending a commit "
+        "after applying it is fine in this session: alock follows it. To roll a target "
+        "back, git revert the applied commit on a branch that contains it and apply the revert; "
         "there's no other way to undo an apply. When your apply moves a target's "
         "record forward, agents in other worktrees or clones can't apply to it until "
         f"they contain your commit, so you're encouraged to tell {PEERS} that they may "
@@ -125,19 +131,24 @@ def status(repo: Repo) -> str:
     lines.append("Held locks:\n" + ("\n".join(held) if held else "  none"))
     try:
         head = repo.head()
-        missing = []
-        refs = records.git(
-            "for-each-ref", "--format=%(refname) %(objectname)",
-            records.LOCAL_NS, records.ORIGIN_NS, cwd=repo.top,
-        ).stdout.splitlines()
-        for line in refs:
-            ref, sha = line.split()
-            if not records.contains(repo, head, sha):
+        records.harvest(repo)
+        missing, checked = [], {}
+        for ref, sha in records.records_in(repo):
+            if sha not in checked:
+                checked[sha] = records.contains(repo, head, sha)
+            if not checked[sha]:
                 missing.append(f"  {ref}: {records.describe_commit(repo, sha)}")
         lines.append(
             "Targets whose last apply this HEAD doesn't contain (applying them from here "
             "is refused):\n" + ("\n".join(missing) if missing else "  none")
         )
+        unnoted = records.unnoted(repo)
+        if unnoted:
+            lines.append(
+                f"{len(unnoted)} records here were applied before alock followed rebases, so "
+                "a rebase or amend of their commits isn't followed yet. Ask the user to run "
+                f"/alock:retrofit -C {repo.top} once in this clone; you can't run it yourself."
+            )
     except AlockError as e:
         lines.append(f"Couldn't check the records: {e}")
     return "\n".join(lines)
@@ -236,8 +247,11 @@ def check_command(command: str) -> str | None:
         if "alock" in command and "config" in command:
             return "alock: couldn't parse this command, and it may change alock.* config."
         return None
+    exported = {}  # `export NAME=value` reaches the commands after it
     for argv in commands:
-        reason = check_argv(argv)
+        if argv[0] == "export":
+            exported.update(a.split("=", 1) for a in argv[1:] if "=" in a)
+        reason = check_argv(argv, exported)
         if reason:
             return reason
     return None
@@ -265,12 +279,24 @@ MODE_IS_USERS = (
 )
 
 
-def check_argv(argv: list[str]) -> str | None:
+REFS_ARE_ALOCKS = (
+    "alock's refs and notes (refs/alock*, refs/notes/alock) are written only by its "
+    "shims: they record what was applied and which commits are rewrites of it. "
+    "Reading them is fine. To get past a refusal, follow its message or tell the user."
+)
+REF_WRITERS = {"update-ref", "push", "fetch"}
+NOTES_READERS = {"list", "show", "get-ref"}
+NOTES_VALUE_OPTIONS = {"--ref"}
+
+
+def check_argv(argv: list[str], exported: dict[str, str] | None = None) -> str | None:
+    assigned = dict(exported or {})
     i = 0
     while i < len(argv) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[i]):
         name, _, value = argv[i].partition("=")
         if name.startswith("GIT_CONFIG") and "alock" in value.lower():
             return MODE_IS_USERS
+        assigned[name] = value
         i += 1
     while i < len(argv) and argv[i] in ("env", "command", "exec", "nohup", "time", "sudo"):
         i += 1
@@ -278,6 +304,7 @@ def check_argv(argv: list[str]) -> str | None:
             name, _, value = argv[i].partition("=")
             if name.startswith("GIT_CONFIG") and "alock" in value.lower():
                 return MODE_IS_USERS
+            assigned[name] = value
             i += 1
     if i >= len(argv):
         return None
@@ -289,25 +316,64 @@ def check_argv(argv: list[str]) -> str | None:
             "Calling it by a path skips the shim."
         )
     if name == "git":
-        return check_git(rest)
+        return check_git(rest, assigned)
     return None
 
 
-def check_git(args: list[str]) -> str | None:
+def check_git(args: list[str], assigned: dict[str, str] | None = None) -> str | None:
+    # Where a notes command could be pointed at alock's notes besides --ref.
+    notes_refs = [(assigned or {}).get("GIT_NOTES_REF", "")]
     i = 0
     while i < len(args) and args[i].startswith("-"):
         arg = args[i]
         if arg == "-c" and i + 1 < len(args):
             if args[i + 1].lower().startswith("alock."):
                 return MODE_IS_USERS
+            if args[i + 1].lower().startswith("core.notesref="):
+                notes_refs.append(args[i + 1])
             i += 2
             continue
         if arg.startswith("--config-env") and "alock" in arg.lower():
             return MODE_IS_USERS
         i += 2 if arg in GIT_GLOBAL_VALUE_OPTIONS else 1
-    if i >= len(args) or args[i] != "config":
+    if i >= len(args):
         return None
-    return check_git_config(args[i + 1 :])
+    sub, rest = args[i], args[i + 1 :]
+    if sub == "config":
+        lowered = [a.lower() for a in rest]
+        if "core.notesref" in lowered and any("alock" in a for a in lowered):
+            return REFS_ARE_ALOCKS  # later `git notes` writes would land in alock's
+        return check_git_config(rest)
+    if sub in REF_WRITERS and any(writes_alock_refs(a) for a in rest):
+        return REFS_ARE_ALOCKS
+    if sub == "notes":
+        ref, notes_sub = parse_notes(rest)
+        if notes_sub not in NOTES_READERS and any("alock" in r for r in [ref, *notes_refs]):
+            return REFS_ARE_ALOCKS
+    return None
+
+
+def writes_alock_refs(arg: str) -> bool:
+    """An argument to update-ref, push or fetch that names alock's refs, or
+    that sweeps them up with every other ref: --mirror, or a refs/* refspec."""
+    return (
+        "refs/alock" in arg or "notes/alock" in arg or arg == "--mirror"
+        or arg.lstrip("+").split(":", 1)[0] in ("refs/*", "*")
+    )
+
+
+def parse_notes(args: list[str]) -> tuple[str, str]:
+    """`git notes [--ref <ref>] [<subcommand>]`: the ref given, and the subcommand."""
+    ref, i = "", 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in NOTES_VALUE_OPTIONS and i + 1 < len(args):
+            ref = args[i + 1]
+            i += 2
+            continue
+        if args[i].startswith("--ref="):
+            ref = args[i][len("--ref="):]
+        i += 1
+    return ref, (args[i] if i < len(args) else "list")
 
 
 def check_git_config(args: list[str]) -> str | None:

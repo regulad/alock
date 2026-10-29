@@ -134,10 +134,12 @@ def check_plan(call: targets.Call, head: str) -> None:
 
 
 def missing_records(repo: Repo, head: str, wanted: list[str]) -> list[str]:
-    missing = []
+    missing, checked = [], {}  # a root's hosts usually share one record
     for target in wanted:
         for ref, sha in records.records(repo, target):
-            if not records.contains(repo, head, sha):
+            if sha not in checked:
+                checked[sha] = records.contains(repo, head, sha)
+            if not checked[sha]:
                 missing.append(f"  {target}: {records.describe_commit(repo, sha)}  [{ref}]")
     return missing
 
@@ -191,6 +193,7 @@ def run_locked(repo: Repo, call: targets.Call, real: str) -> int:
 
     acquired = locks.acquire(repo, backend, wanted, holder_base, timeout(), first_record)
     try:
+        records.harvest(repo)
         origin = records.fetch_origin(repo, wanted) if repo.mode == "remote" else {}
         missing = missing_records(repo, head, wanted)
         if missing:
@@ -200,15 +203,24 @@ def run_locked(repo: Repo, call: targets.Call, real: str) -> int:
                 + "\n".join(missing)
                 + "\nTo keep those changes: merge or rebase onto the branch they came from "
                 "(usually: wait for it to reach master, then bring master in), commit, and "
-                "apply again.\nTo undo them on purpose: git revert the applied commits on a "
-                "branch that contains them (merge their branch in first if it never "
-                "landed), and apply the revert. That's alock's only way to roll back.",
+                "apply again.\nIf HEAD already has them, but they were squashed, or rebased "
+                "or amended where alock couldn't follow (outside an alock session, or in "
+                "another clone that hasn't applied since), alock can't tell. If they were "
+                "squashed, check out the squash commit and apply from it first; if that's "
+                "refused too, apply from their branch's tip before it. Otherwise, make a "
+                "scratch branch from HEAD, git merge the applied commit into it, resolving "
+                "any conflicts toward what should be live, and apply from there. Either "
+                "way, HEAD then contains what was last applied.\n"
+                "To undo them on purpose: git revert the applied commits on a branch that "
+                "contains them (merge their branch in first if it never landed), and apply "
+                "the revert. That's alock's only way to roll back.",
                 EXIT_REFUSED,
             )
         moved = [
             t for t in wanted
             if all(sha != head for _, sha in records.records(repo, t))
         ]
+        records.mark_applied(repo, head)
         # Record before running: a run that fails part-way has still changed its targets.
         if repo.mode == "remote":
             records.push_records(repo, head, origin)

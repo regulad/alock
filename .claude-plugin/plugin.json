@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "alock",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Locks OpenTofu, Terraform and Ansible applies so parallel agents can't overlap or undo each other",
   "author": {
     "name": "Parker Wahle",

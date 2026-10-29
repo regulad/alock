@@ -38,7 +38,7 @@ To have every session in a repository load it, commit this to the repository's
 {
   "extraKnownMarketplaces": {
     "alock": {
-      "source": { "source": "github", "repo": "regulad/alock", "ref": "alock--v0.1.0" }
+      "source": { "source": "github", "repo": "regulad/alock", "ref": "alock--v0.2.0" }
     }
   },
   "enabledPlugins": { "alock@alock": true }
@@ -100,9 +100,19 @@ To have every session in a repository load it, commit this to the repository's
   or clones can't apply to that target until they contain the commit. The
   shim says so after the apply, and encourages the agent to tell the others so
   they can rebase onto it.
+- **Rebase freely.** Rebasing, amending or fixing up a commit after applying
+  it is fine in an agent's session: alock follows the rewrite through git
+  notes. A hosting service's rebase-merge is followed too. A squash merge is
+  followed until its lines change again; to keep it simple, apply from the
+  squash commit once it lands. For your own terminal's rebases to be followed
+  as well, run `git config --global --add notes.rewriteRef refs/notes/alock`.
+- **Upgrading from 0.1.0,** run `/alock:retrofit` once in each clone. It notes
+  the commits 0.1.0 applied, so rebasing them is followed from then on. A
+  rebase made before the retrofit can't be followed.
 - **Remote mode** keeps its locks with the remote's Git LFS locking API and its
   records as refs under `refs/alock/` on `origin`, so an apply pushes the
-  commit it applies from.
+  commit it applies from. It also pushes the rewrites it has followed, under
+  `refs/alock-rewrites/`, so other clones can follow them too.
 
 ## Test
 

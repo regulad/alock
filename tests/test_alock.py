@@ -24,6 +24,7 @@ STUBS = ROOT / "tests" / "stubs" / "bin"
 FAKE_LFS = ROOT / "tests" / "stubs" / "fake_git_lfs.py"
 HOOK = ROOT / "libexec" / "hook.py"
 BREAK = ROOT / "libexec" / "break.py"
+RETROFIT = ROOT / "libexec" / "retrofit.py"
 
 CONFIG = {
     "tf": {
@@ -31,6 +32,13 @@ CONFIG = {
         "tofu/plain": {},
     }
 }
+
+# tofu/plain's variables, one per line, so changes can share or neighbour lines.
+VARS = "tofu/plain/vars.tf"
+
+
+def vars_text(**values: int) -> str:
+    return "".join(f"{name} = {values.get(name, 1)}\n" for name in "abcde")
 
 
 class Lab:
@@ -60,6 +68,8 @@ class Lab:
             "ALOCK_GIT_LFS": f"python3 {FAKE_LFS}",
             "FAKE_LFS_DIR": str(self.dir / "lfs"),
             "LANG": "C.UTF-8",
+            # As the SessionStart hook exports it: rewrites keep alock's notes.
+            "GIT_NOTES_REWRITE_REF": "refs/notes/alock",
         }
         self.origin = self.dir / "origin.git"
         self.git(self.dir, "init", "-q", "--bare", str(self.origin))
@@ -70,6 +80,7 @@ class Lab:
         for root in ("tofu/net", "tofu/plain", "tofu/other"):
             (seed / root).mkdir(parents=True)
             (seed / root / "main.tf").write_text("# stub\n")
+        (seed / VARS).write_text(vars_text())
         (seed / "inventory.yml").write_text("# stub\n")
         (seed / "site.yml").write_text("# stub\n")
         self.git(seed, "add", "-A")
@@ -84,8 +95,10 @@ class Lab:
             self.git(path, "config", "alock.mode", mode)
         return path
 
-    def git(self, cwd, *args) -> str:
-        proc = subprocess.run(["git", *args], cwd=cwd, env=self.env, text=True, capture_output=True)
+    def git(self, cwd, *args, env=None) -> str:
+        proc = subprocess.run(
+            ["git", *args], cwd=cwd, env={**self.env, **(env or {})}, text=True, capture_output=True
+        )
         if proc.returncode != 0:
             raise AssertionError(f"git {args} failed: {proc.stderr}")
         return proc.stdout.strip()
@@ -443,6 +456,411 @@ class AlockTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+# The environment of a terminal without alock's session: rewrites drop its notes.
+NO_NOTES = {"GIT_NOTES_REWRITE_REF": ""}
+
+
+class RewriteTest(unittest.TestCase):
+    """Applied commits that are rebased, amended or squashed afterwards. Each
+    starts from an apply of b = 2 on a feature branch, made from master."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.addCleanup(self.lab.cleanup)
+        self.repo = self.lab.clone("a")
+
+    def apply(self, repo=None) -> subprocess.CompletedProcess:
+        return self.lab.run((repo or self.repo) / "tofu/plain", "tofu", "apply")
+
+    def assertApplies(self, repo=None):
+        result = self.apply(repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def assertRefused(self, repo=None) -> str:
+        result = self.apply(repo)
+        self.assertEqual(result.returncode, 77, result.stderr)
+        self.assertIn("doesn't contain what was last applied", result.stderr)
+        return result.stderr
+
+    def set_vars(self, message, repo=None, **values) -> str:
+        return self.lab.commit(repo or self.repo, VARS, vars_text(**values), message)
+
+    def switch(self, branch, repo=None):
+        self.lab.git(repo or self.repo, "switch", "-q", branch)
+
+    def apply_feature(self, **values) -> str:
+        """Commit values on a new feature branch, apply them, and stay there."""
+        self.lab.git(self.repo, "switch", "-q", "-c", "feature")
+        applied = self.set_vars("feature", **values)
+        self.assertApplies()
+        return applied
+
+    def squash_feature(self):
+        self.switch("master")
+        self.lab.git(self.repo, "merge", "-q", "--squash", "feature")
+        self.lab.git(self.repo, "commit", "-q", "-m", "squashed feature")
+
+    def rebase_through_conflict(self, onto, resolution, repo=None, env=None):
+        """Rebase the current branch onto onto, whose change to vars.tf
+        conflicts, resolving vars.tf to resolution's values."""
+        repo = repo or self.repo
+        env = {**(env or {}), "GIT_EDITOR": "true"}
+        rebase = self.lab.run(repo, "git", "rebase", "-q", onto, env=env)
+        self.assertNotEqual(rebase.returncode, 0, "the rebase was meant to conflict")
+        (repo / VARS).write_text(vars_text(**resolution))
+        self.lab.git(repo, "add", VARS)
+        done = self.lab.run(repo, "git", "rebase", "--continue", env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def rewrite_refs(self, repo=None) -> list[str]:
+        out = self.lab.git(repo or self.repo, "for-each-ref", "--format=%(refname)", "refs/alock-rewrites")
+        return out.split()
+
+    # --- the applied branch lands --------------------------------------------
+
+    def test_merge_keeps_the_apply(self):
+        self.apply_feature(b=2)
+        self.switch("master")
+        self.lab.git(self.repo, "merge", "-q", "--no-ff", "-m", "merge feature", "feature")
+        self.assertApplies()
+
+    def test_squash_then_unrelated_change(self):
+        self.apply_feature(b=2)
+        self.squash_feature()
+        self.lab.commit(self.repo, "unrelated.txt")
+        self.assertApplies()
+
+    def test_squash_then_nearby_changes_need_the_squash_applied(self):
+        # A squash commit isn't a copy of the applied commit, so once its lines
+        # change again, alock can't tell it from an unrelated change.
+        self.apply_feature(b=2)
+        self.squash_feature()
+        squash = self.lab.git(self.repo, "rev-parse", "HEAD")
+        self.set_vars("b again", b=3)
+        self.set_vars("c", b=3, c=2)
+        message = self.assertRefused()
+        self.assertIn("check out the squash commit and apply from it first", message)
+        self.lab.git(self.repo, "switch", "-q", "--detach", squash)
+        self.assertApplies()
+        self.switch("master")
+        self.assertApplies()
+
+    def test_squash_then_revert_needs_the_squash_applied(self):
+        self.apply_feature(b=2)
+        self.squash_feature()
+        self.lab.git(self.repo, "revert", "--no-edit", "HEAD")
+        self.assertRefused()
+        self.lab.git(self.repo, "switch", "-q", "--detach", "HEAD~1")
+        self.assertApplies()
+        self.switch("master")
+        self.assertApplies()
+
+    def rebase_merge_feature(self):
+        """Land feature as a hosting service's rebase-merge does: master moves
+        on, then a clean rebase that keeps no notes, fast-forwarded."""
+        self.switch("master")
+        self.lab.commit(self.repo, "unrelated.txt")
+        self.switch("feature")
+        self.lab.git(self.repo, "rebase", "-q", "master", env=NO_NOTES)
+        self.switch("master")
+        self.lab.git(self.repo, "merge", "-q", "--ff-only", "feature")
+
+    def test_rebase_merge_then_the_same_line_changes_again(self):
+        self.apply_feature(b=2)
+        self.rebase_merge_feature()
+        self.set_vars("b again", b=3)
+        self.set_vars("c", b=3, c=2)
+        self.assertApplies()
+
+    def test_rebase_merge_then_revert_rolls_back(self):
+        self.apply_feature(b=2)
+        self.rebase_merge_feature()
+        self.lab.git(self.repo, "revert", "--no-edit", "HEAD")
+        self.assertApplies()
+
+    # --- the applied branch is rewritten -------------------------------------
+
+    def test_rebase_through_a_conflict_keeps_the_apply(self):
+        applied = self.apply_feature(b=2)
+        self.switch("master")
+        self.set_vars("another agent's c", c=9)
+        self.switch("feature")
+        self.rebase_through_conflict("master", {"b": 2, "c": 9})
+        rebased = self.lab.git(self.repo, "rev-parse", "HEAD")
+        self.assertApplies()
+        self.assertEqual(self.rewrite_refs(), [f"refs/alock-rewrites/{applied}/{rebased}"])
+
+    def test_rebased_branch_lands_without_another_apply(self):
+        self.apply_feature(b=2)
+        self.switch("master")
+        self.set_vars("another agent's c", c=9)
+        self.switch("feature")
+        self.rebase_through_conflict("master", {"b": 2, "c": 9})
+        self.switch("master")
+        self.lab.git(self.repo, "merge", "-q", "--ff-only", "feature")
+        self.assertApplies()
+
+    def test_amend_keeps_the_apply(self):
+        self.apply_feature(b=2)
+        (self.repo / VARS).write_text(vars_text(b=5))
+        self.lab.git(self.repo, "commit", "-q", "--amend", "-a", "--no-edit")
+        self.assertApplies()
+
+    def test_fixup_keeps_the_apply(self):
+        self.apply_feature(b=2)
+        self.set_vars("fixup! feature", b=5)
+        self.lab.git(
+            self.repo, "rebase", "-q", "-i", "--autosquash", "master",
+            env={"GIT_SEQUENCE_EDITOR": "true"},
+        )
+        self.assertEqual(self.lab.git(self.repo, "rev-list", "--count", "master..HEAD"), "1")
+        self.assertApplies()
+
+    def test_conflict_in_an_earlier_commit_keeps_the_apply(self):
+        # Only the tip was applied, but every commit it brought was noted, so
+        # the earlier commit's conflicted rebase is followed too.
+        self.lab.git(self.repo, "switch", "-q", "-c", "feature")
+        self.set_vars("feature: b", b=2)
+        self.lab.commit(self.repo, "tofu/plain/more.tf", message="feature: more")
+        self.assertApplies()
+        self.switch("master")
+        self.set_vars("another agent's c", c=9)
+        self.switch("feature")
+        self.rebase_through_conflict("master", {"b": 2, "c": 9})
+        self.assertApplies()
+
+    def test_rewrites_of_rewrites_keep_the_apply(self):
+        self.apply_feature(b=2)
+        self.switch("master")
+        self.set_vars("another agent's c", c=9)
+        self.switch("feature")
+        self.rebase_through_conflict("master", {"b": 2, "c": 9})
+        (self.repo / VARS).write_text(vars_text(b=5, c=9))
+        self.lab.git(self.repo, "commit", "-q", "--amend", "-a", "--no-edit")
+        self.assertApplies()
+
+    def test_rebased_then_rebase_merged(self):
+        # Rebased here, then rebased again by a hosting service, which keeps no notes.
+        self.apply_feature(b=2)
+        self.switch("master")
+        self.set_vars("another agent's c", c=9)
+        self.switch("feature")
+        self.rebase_through_conflict("master", {"b": 2, "c": 9})
+        self.switch("master")
+        self.lab.commit(self.repo, "unrelated.txt")
+        self.switch("feature")
+        self.lab.git(self.repo, "rebase", "-q", "master", env=NO_NOTES)
+        self.switch("master")
+        self.lab.git(self.repo, "merge", "-q", "--ff-only", "feature")
+        self.assertApplies()
+
+    # --- what stays refused --------------------------------------------------
+
+    def test_a_rewrite_doesnt_admit_a_head_without_it(self):
+        self.apply_feature(b=2)
+        self.switch("master")
+        self.set_vars("another agent's c", c=9)
+        self.switch("feature")
+        self.rebase_through_conflict("master", {"b": 2, "c": 9})
+        self.switch("master")  # has c = 9, but neither the apply nor its rebase
+        self.assertRefused()
+
+    def test_a_different_change_to_the_line_is_refused(self):
+        self.apply_feature(b=2)
+        self.switch("master")
+        self.set_vars("b, never having had 2", b=3)
+        self.assertRefused()
+
+    def test_other_changes_to_the_file_are_refused(self):
+        self.apply_feature(b=2)
+        self.switch("master")
+        self.set_vars("d", d=2)
+        self.set_vars("e", d=2, e=2)
+        self.assertRefused()
+
+    def test_a_copy_held_then_undone_is_a_deliberate_undo(self):
+        # Like a revert: master held a copy of the apply, then a commit on top
+        # set it back.
+        self.apply_feature(b=2)
+        self.rebase_merge_feature()
+        self.set_vars("b back", b=1)
+        self.assertApplies()
+
+    def test_the_same_change_made_and_undone_elsewhere_is_refused(self):
+        # Another branch happened to set b = 2 and backed it out before this
+        # apply; that undo was never made on top of the applied change.
+        self.lab.git(self.repo, "switch", "-q", "-c", "other")
+        self.set_vars("try b", b=2)
+        self.set_vars("untry b", b=1)
+        self.lab.commit(self.repo, "other.txt")
+        self.switch("master")
+        self.apply_feature(b=2)
+        self.switch("other")
+        self.assertRefused()
+
+    def test_rebase_leaving_the_applied_parent_behind_is_refused(self):
+        self.lab.git(self.repo, "switch", "-q", "-c", "feature")
+        self.set_vars("feature: b", b=2)
+        self.lab.commit(self.repo, "tofu/plain/more.tf", message="feature: more")
+        self.assertApplies()
+        self.lab.git(self.repo, "rebase", "-q", "--onto", "master", "HEAD~1")
+        self.assertRefused()
+
+    def test_rebase_dropping_the_applied_parent_is_refused(self):
+        self.lab.git(self.repo, "switch", "-q", "-c", "feature")
+        self.set_vars("feature: b", b=2)
+        self.lab.commit(self.repo, "tofu/plain/more.tf", message="feature: more")
+        self.assertApplies()
+        self.lab.git(
+            self.repo, "rebase", "-q", "-i", "master",
+            env={"GIT_SEQUENCE_EDITOR": "sed -i.bak '1s/^pick/drop/'"},
+        )
+        self.assertRefused()
+
+    def test_rebase_flattening_away_a_merge_is_refused(self):
+        # The merge brought its own content, which a rebase drops without conflict.
+        self.lab.git(self.repo, "switch", "-q", "-c", "side")
+        self.lab.commit(self.repo, "side.txt")
+        self.lab.git(self.repo, "switch", "-q", "-c", "feature", "master")
+        self.lab.git(self.repo, "merge", "-q", "--no-ff", "--no-commit", "side")
+        (self.repo / "tofu/plain/extra.tf").write_text("# only in the merge\n")
+        self.lab.git(self.repo, "add", "-A")
+        self.lab.git(self.repo, "commit", "-q", "-m", "merge side, with extra")
+        self.set_vars("feature: b", b=2)
+        self.assertApplies()
+        self.switch("master")
+        self.lab.commit(self.repo, "unrelated.txt")
+        self.switch("feature")
+        self.lab.git(self.repo, "rebase", "-q", "master")
+        self.assertFalse((self.repo / "tofu/plain/extra.tf").exists())
+        self.assertRefused()
+
+    def test_rebase_onto_master_leaving_another_agents_apply_behind_is_refused(self):
+        # Agent X applies on branch x; Y rebases onto x as alock suggests and
+        # applies; then Y tidies its branch onto master, leaving x's commit out.
+        self.lab.git(self.repo, "switch", "-q", "-c", "x")
+        self.set_vars("X: c", c=9)
+        self.assertApplies()
+        self.lab.git(self.repo, "switch", "-q", "-c", "y", "master")
+        self.lab.commit(self.repo, "tofu/plain/y.tf", message="Y: y.tf")
+        self.lab.git(self.repo, "rebase", "-q", "x")
+        self.assertApplies()
+        self.lab.git(self.repo, "rebase", "-q", "--onto", "master", "x")
+        self.assertRefused()
+
+    def test_squash_of_a_later_unapplied_change_needs_the_tip_applied(self):
+        self.apply_feature(b=2)
+        self.set_vars("b again, not applied", b=5)
+        self.squash_feature()
+        message = self.assertRefused()
+        self.assertIn("apply from their branch's tip before it", message)
+        # Following the message: the tip contains the apply, and master holds the tip.
+        self.switch("feature")
+        self.assertApplies()
+        self.switch("master")
+        self.assertApplies()
+
+    def test_rewrite_without_notes_needs_a_scratch_merge(self):
+        applied = self.apply_feature(b=2)
+        (self.repo / VARS).write_text(vars_text(b=5))
+        self.lab.git(self.repo, "commit", "-q", "--amend", "-a", "--no-edit", env=NO_NOTES)
+        message = self.assertRefused()
+        self.assertIn("make a scratch branch from HEAD", message)
+        self.assertEqual(self.rewrite_refs(), [])
+        # Following the message: merge the applied commit into a scratch branch.
+        self.lab.git(self.repo, "switch", "-q", "-c", "scratch")
+        merge = self.lab.run(self.repo, "git", "merge", "-q", applied)
+        self.assertNotEqual(merge.returncode, 0, "the merge was meant to conflict")
+        (self.repo / VARS).write_text(vars_text(b=5))
+        self.lab.git(self.repo, "commit", "-q", "-a", "--no-edit")
+        self.assertApplies()
+        self.switch("feature")
+        self.assertApplies()
+
+    # --- retrofit -------------------------------------------------------------
+
+    def forget_notes(self, repo=None):
+        """Leave the clone as an apply before alock followed rebases left it."""
+        self.lab.git(repo or self.repo, "update-ref", "-d", "refs/notes/alock")
+
+    def retrofit(self, repo=None, *args) -> str:
+        result = self.lab.run(repo or self.repo, "python3", str(RETROFIT), *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_retrofit_lets_a_rebase_of_an_old_apply_be_followed(self):
+        applied = self.apply_feature(b=2)
+        self.forget_notes()
+        out = self.retrofit()
+        self.assertIn("alock: noted 2 commits", out)  # the apply and the seed it brought
+        self.assertIn("refs/alock/tf/tofu%2Fplain", out)
+        self.assertIn(f"applied {applied}", self.lab.git(self.repo, "notes", "--ref=alock", "show", applied))
+        self.assertIn("already noted", self.retrofit())
+        self.switch("master")
+        self.set_vars("another agent's c", c=9)
+        self.switch("feature")
+        self.rebase_through_conflict("master", {"b": 2, "c": 9})
+        self.assertApplies()
+
+    def test_a_rebase_before_retrofit_stays_refused(self):
+        # git copies notes only as it rewrites, so retrofit can't link it afterwards.
+        self.apply_feature(b=2)
+        self.forget_notes()
+        self.switch("master")
+        self.set_vars("another agent's c", c=9)
+        self.switch("feature")
+        self.rebase_through_conflict("master", {"b": 2, "c": 9})
+        self.retrofit()
+        self.assertRefused()
+
+    def test_retrofit_names_the_repository_and_where_alock_isnt_on(self):
+        self.apply_feature(b=2)
+        self.forget_notes()
+        other = self.lab.dir / "other"
+        self.lab.git(self.lab.dir, "init", "-q", str(other))
+        self.assertIn("has no .alock.json", self.retrofit(other))
+        self.assertIn("alock: noted", self.retrofit(other, "-C", str(self.repo)))
+        self.lab.git(self.repo, "config", "alock.mode", "bypass")
+        self.assertIn("alock.mode is bypass", self.retrofit())
+        self.assertIn("Usage", self.retrofit(self.repo, "extra"))
+
+    def test_retrofit_notes_origins_records_in_remote_mode(self):
+        one = self.lab.clone("one", mode="remote")
+        two = self.lab.clone("two", mode="remote")
+        self.lab.git(one, "switch", "-q", "-c", "feature")
+        applied = self.set_vars("feature", repo=one, b=2)
+        self.assertApplies(one)
+        out = self.retrofit(two)
+        self.assertIn("refs/alock-origin/tf/tofu%2Fplain", out)
+        self.assertIn("run /alock:retrofit in each clone", out)
+        self.assertIn(f"applied {applied}", self.lab.git(two, "notes", "--ref=alock", "show", applied))
+
+    # --- remote mode ---------------------------------------------------------
+
+    def test_remote_rewrite_reaches_other_clones_with_the_next_apply(self):
+        one = self.lab.clone("one", mode="remote")
+        two = self.lab.clone("two", mode="remote")
+        self.lab.git(one, "switch", "-q", "-c", "feature")
+        applied = self.set_vars("feature", repo=one, b=2)
+        self.assertApplies(one)
+        # Another agent's change lands; one rebases over it and lands the rebase.
+        self.set_vars("another agent's c", repo=two, c=9)
+        self.lab.git(two, "push", "-q", "origin", "master")
+        self.lab.git(one, "fetch", "-q", "origin")
+        self.rebase_through_conflict("origin/master", {"b": 2, "c": 9}, repo=one)
+        rebased = self.lab.git(one, "rev-parse", "HEAD")
+        self.lab.git(one, "push", "-q", "origin", "HEAD:master")
+        self.lab.git(two, "pull", "-q", "--ff-only", "origin", "master")
+        # two can't follow the rebase until one publishes it, with its next apply.
+        self.assertRefused(two)
+        result = self.lab.run(one, "ansible-playbook", "site.yml", "--limit", "h9")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ref = f"refs/alock-rewrites/{applied}/{rebased}"
+        self.assertEqual(self.lab.git(self.lab.origin, "rev-parse", ref), rebased)
+        self.assertApplies(two)
+        self.assertIn(ref, self.rewrite_refs(two))
+
+
 class HookTest(unittest.TestCase):
     def setUp(self):
         self.lab = Lab()
@@ -485,6 +903,38 @@ class HookTest(unittest.TestCase):
             "git config user.name Someone",
             "tofu apply -auto-approve",
             "ansible-playbook site.yml",
+        ):
+            self.assertEqual(self.decision(command), "allow", command)
+
+    def test_denies_writing_alocks_refs_and_notes(self):
+        for command in (
+            "git notes --ref=alock add -m 'applied abc' HEAD",
+            "git notes --ref alock append -m x HEAD",
+            "git notes --ref refs/notes/alock copy A B",
+            "GIT_NOTES_REF=refs/notes/alock git notes add -m x",
+            "git -c core.notesRef=refs/notes/alock notes edit",
+            "git update-ref refs/alock-rewrites/a/b HEAD",
+            "git update-ref -d refs/alock/tf/tofu%2Fplain",
+            "git push origin HEAD:refs/alock-rewrites/a/b",
+            "git push origin :refs/alock/tf/x",
+            "git fetch origin 'refs/alock/*:refs/alock/*'",
+            "git push --mirror origin",
+            "git fetch --prune origin '+refs/*:refs/*'",
+            "export GIT_NOTES_REF=refs/notes/alock; git notes add -m x",
+            "git config core.notesRef refs/notes/alock",
+        ):
+            self.assertEqual(self.decision(command), "deny", command)
+        for command in (
+            "git notes --ref=alock show HEAD",
+            "git notes --ref alock list",
+            "git notes --ref=alock",
+            "git notes add -m 'about alock' HEAD",
+            "git log --notes=alock",
+            "git for-each-ref refs/alock-rewrites",
+            "git push origin feature",
+            "git fetch origin",
+            "git push origin 'refs/heads/*:refs/heads/*'",
+            "git config core.notesRef",
         ):
             self.assertEqual(self.decision(command), "allow", command)
 
@@ -549,6 +999,20 @@ class HookTest(unittest.TestCase):
         ).stdout
         self.assertEqual(path, f"{SHIMS}:/usr/bin:/bin")  # first, and only once
 
+    def test_session_start_exports_the_notes_rewrite_ref(self):
+        env_file = self.lab.dir / "env.sh"
+        self.hook("SessionStart", {"session_id": "abc", "cwd": str(self.lab.dir)},
+                  env={"CLAUDE_ENV_FILE": str(env_file)})
+        for before, after in (
+            ({}, "refs/notes/alock"),
+            ({"GIT_NOTES_REWRITE_REF": "refs/notes/commits"}, "refs/notes/alock:refs/notes/commits"),
+        ):
+            value = subprocess.run(
+                ["sh", "-c", f'. "{env_file}"; . "{env_file}"; printf %s "$GIT_NOTES_REWRITE_REF"'],
+                env={"PATH": "/usr/bin:/bin", **before}, text=True, capture_output=True,
+            ).stdout
+            self.assertEqual(value, after)  # added once, keeping what was there
+
     def test_session_start_bypass_and_status(self):
         repo = self.lab.clone("a", mode="bypass")
         out = self.hook("SessionStart", {"session_id": "abc", "cwd": str(repo)})
@@ -560,6 +1024,12 @@ class HookTest(unittest.TestCase):
         context = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("local mode", context)
         self.assertIn("Held locks:\n  none", context)
+        self.assertNotIn("/alock:retrofit", context)
+        # A record from before alock followed rebases asks for a retrofit.
+        self.lab.git(repo, "update-ref", "-d", "refs/notes/alock")
+        out = self.hook("SessionStart", {"session_id": "abc", "cwd": str(repo)})
+        context = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"/alock:retrofit -C {repo}", context)
 
 
 if __name__ == "__main__":

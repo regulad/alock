@@ -33,8 +33,9 @@ sits underneath it.
 - **Each target's record** is the ref `refs/alock/<target>`, pointing at the
   commit the target was last applied from and keeping that commit reachable.
 - **The rule:** a change to a target is allowed only if HEAD contains the
-  commit its record points at. Applies to a target therefore move forward
-  along a single line, and none can undo another.
+  commit its record points at, as an ancestor, as a rewrite or as a change
+  HEAD's history already holds (see Containment). Applies to a target
+  therefore move forward along a single line, and none can undo another.
 - **Changes run from commits.** An agent commits on its own worktree branch,
   then applies.
 - **Rolling back is a `git revert`.**
@@ -45,6 +46,9 @@ sits underneath it.
     other agent then needs it too, as with any change.
   - alock has no command that erases or rewinds a record. The refusal message
     and the SessionStart context both tell agents this.
+- **Rebasing an applied commit is fine.** A commit rebased or amended after
+  it was applied keeps its place on the line: git copies alock's note onto
+  the rewrite, and alock follows it (see Containment).
 - **Moving a record forward is worth announcing.**
   - Once an apply records a new commit for a target, agents in other worktrees
     or clones can't apply to it until they contain that commit.
@@ -133,7 +137,7 @@ The mode is the git config value `alock.mode`, in one of four states:
 | unset | none: every changing call in a configured repository is refused | none |
 | `bypass` | none: changing calls run unlocked and unchecked, with a warning | none |
 | `local` | `flock` on `<common dir>/alock/locks/<target>` | `refs/alock/<target>` in this clone |
-| `remote` | a Git LFS lock on the synthetic path `+<target>`, through the hosting service's locking API | `refs/alock/<target>` in this clone and on `origin`, pushed with its commit |
+| `remote` | a Git LFS lock on the synthetic path `+<target>`, through the hosting service's locking API | `refs/alock/<target>` in this clone and on `origin`, pushed with its commit and the rewrite refs |
 
 - **It is read by ordinary git config lookup:** system, global, the clone's
   own config and per-worktree config. A global value therefore sets the mode
@@ -169,14 +173,18 @@ The mode is the git config value `alock.mode`, in one of four states:
   - `origin`'s records are fetched into `refs/alock-origin/<target>`, so they
     never overwrite this clone's own. The default fetch refspec includes
     neither namespace, so ordinary fetches and clones never see the records.
+  - `origin`'s rewrite refs are fetched under their own names. Each is named
+    for the commit it points at, so a clone's copy and `origin`'s can't
+    disagree.
 
 **Git's own layout.**
 - **The common dir** is `git rev-parse --git-common-dir`, the git directory
   every worktree of a clone shares. Git leaves directories it doesn't know
   there alone. alock never resolves its paths with `git rev-parse --git-path`,
   which maps paths Git doesn't know to the worktree's own directory.
-- **Refs under `refs/alock/` and `refs/alock-origin/`** are shared by all of a
-  clone's worktrees, as are all refs but `refs/bisect`, `refs/worktree` and
+- **Refs under `refs/alock/`, `refs/alock-origin/` and `refs/alock-rewrites/`,
+  and the notes ref `refs/notes/alock`,** are shared by all of a clone's
+  worktrees, as are all refs but `refs/bisect`, `refs/worktree` and
   `refs/rewritten`.
 
 **Holder files.** Each lock taken has a holder file in this clone,
@@ -217,23 +225,27 @@ a subagent's run from its parent's. Their pids and commands still differ.
        `ListAgents` returns that work in this repository, its worktrees or its
        clones, through `SendMessage`, not every session it lists.
 4. **In remote mode, fetch the targets' records** from `origin` into
-   `refs/alock-origin/<target>`, along with the commits they point at.
+   `refs/alock-origin/<target>`, along with the commits they point at, and
+   every rewrite ref on `origin` this clone lacks.
 5. **Check each target's records:** this clone's `refs/alock/<target>` and, in
-   remote mode, `refs/alock-origin/<target>`. HEAD contains a record when
-   either:
-   - the commit is an ancestor of HEAD (`git merge-base --is-ancestor`); or
-   - merging it into HEAD changes nothing (`git merge-tree --write-tree`),
-     which covers a rebase or squash of an applied commit.
+   remote mode, `refs/alock-origin/<target>`. First, every note git copied
+   onto a rewrite becomes its rewrite ref. HEAD must then contain each record,
+   as Containment defines.
 
    Otherwise the call fails without running, naming the commit and its target.
+   The message also says what to do when HEAD has the change in a form alock
+   can't follow.
 6. **Record HEAD as each target's last-applied commit, before running.** A run
    that fails or is killed part-way has still changed its targets.
+   - **First, HEAD and the commits it brings get their notes,** as
+     Containment describes. This clone's writers take turns on a `flock`.
    - **Local mode:** one `git update-ref --stdin` transaction, checking each
      ref's old value.
    - **Remote mode:** first `git push --atomic origin`, with
      `--force-with-lease=refs/alock/<target>:<old>` for each target, `<old>`
-     being the value just fetched. This publishes HEAD's commit and its
-     ancestry. Then the same `git update-ref` transaction sets this clone's
+     being the value just fetched, and every rewrite ref this clone has. This
+     publishes HEAD's commit and its ancestry, and each rewrite with its own.
+     Then the same `git update-ref` transaction sets this clone's
      `refs/alock/<target>` and `refs/alock-origin/<target>`.
 
    A failed compare-and-swap means a lock was bypassed. The call stops without
@@ -263,6 +275,90 @@ A saved plan must come from the HEAD it's applied at. When an apply names a
 plan file, the shim reads the commit it was made from out of the file's name
 (`<anything>@<sha>.tfplan`) and refuses one that isn't HEAD. OpenTofu and
 Terraform themselves already refuse a saved plan whose state has moved on.
+
+## Containment
+
+HEAD contains a record R when, for some commit C in R's line, either:
+- **C is an ancestor of HEAD** (`git merge-base --is-ancestor`); or
+- **HEAD holds C's change:** merging C into some commit D changes nothing
+  (`git merge-tree --write-tree`), where D is HEAD itself or a copy of C in
+  HEAD's history since their merge base. A copy has C's author, author date
+  and subject, as rebases, cherry-picks and a hosting service's rebase-merge
+  keep them.
+
+**R's line** is R and each rewrite of R that carries all of R.
+- **Notes.** Each apply notes HEAD, and every commit HEAD brings that no
+  record in this clone reaches yet (the most recent 1,000), with
+  `applied <commit>` in `refs/notes/alock`. It writes them in one
+  `git fast-import`, which refuses to move the ref if a rebase elsewhere moved
+  it first; then it reads the notes again and retries.
+- **Copying.** The SessionStart hook exports
+  `GIT_NOTES_REWRITE_REF=refs/notes/alock`. With it, `git rebase` (including
+  `-i`, fixups and squashes) and `git commit --amend` copy each note onto the
+  commit that replaces the noted one, with or without conflicts. A rewrite of a
+  rewrite carries the same note, so it names the original too.
+- **Rewrite refs.** Before a check, each copied note becomes the ref
+  `refs/alock-rewrites/<noted>/<rewrite>`, pointing at the rewrite. It keeps
+  the rewrite reachable after its branch is gone and, in remote mode, carries
+  it to `origin`. A ref whose name isn't the commit it points at is ignored.
+- **Carrying all of R.** A note vouches only for its commit's own change, but
+  applying R put R's whole tree live. A rebase can leave some of R's ancestors
+  out, as `--onto`, a dropped commit, or a flattened merge does. So a rewrite
+  R' joins R's line only if every commit that R has and R' doesn't, other than
+  R, has a rewrite of its own in R''s history or has its change held by R'.
+  That's why each apply notes all the commits it brings, not just HEAD.
+
+**Why it's safe.** The ancestry rule rests on one fact: once a change is in
+HEAD's history, the only way to lose it is a commit, or a merge resolution,
+made on top of it. That's a deliberate change, like a revert. Each extension
+keeps the fact:
+- **A copy of C that holds C's change** was made from C. Anything between it
+  and HEAD that removes the change was made on top of it: a three-way merge
+  never drops a change that only one side made, and when both sides change the
+  same lines, it conflicts and someone resolves it. An unrelated commit that
+  merely makes the same change is no such evidence: undoing it, even before C
+  was applied, says nothing about C. So only HEAD itself, which holds the
+  change now, and copies of C are tried.
+- **A rewrite is trusted as much as a merge already is.** Whoever rebases or
+  amends a noted commit has its change in front of them, and resolves any
+  conflict with it, as they would in `git merge`, whose result alock already
+  accepts as a descendant. Everything else R put live must reach R' through its
+  own rewrite, or already be there.
+
+So an apply alock allows either contains every applied change, or lost one
+through a commit made on top of it. Everything else is refused. Two
+consequences follow, both as with ancestry:
+- **An agent that copied a commit and reverted it** before the commit was
+  applied may apply over it afterwards. The same is true of an agent that
+  merged the commit and reverted it.
+- **Editing a noted commit during a rebase,** for example splitting it and
+  committing only part, is trusted as an amend is.
+
+**What it can't follow** is refused, never let through. The refusal says how
+to proceed:
+- **A squash** that git didn't make, such as a hosting service's squash
+  merge, once the squashed lines change again or are reverted. A squash commit
+  isn't a copy. Applying the squash commit first gives HEAD a record it
+  descends from. If the branch changed the applied lines again after the
+  apply, its tip has to be applied before the squash commit.
+- **A rewrite without the note:** made outside an alock session, with
+  `notes.rewrite.<command>` turned off, or by a cherry-pick that conflicted.
+  Merging the applied commit into a scratch branch from HEAD, and applying
+  from there, gives HEAD a record it contains.
+- **A rebase that conflicts in an ancestor no apply noted,** beyond the most
+  recent 1,000 commits, or that flattens a merge whose sides conflicted.
+- **In remote mode,** a rewrite reaches other clones only with the rewriting
+  clone's next apply, which pushes its rewrite refs. Notes stay in the clone
+  that wrote them, so a rewrite made in another clone of a commit noted
+  elsewhere isn't linked.
+
+**What remote mode publishes.** Each apply pushes every rewrite ref this clone
+has, and with it each rewrite and its ancestry. These are rewrites of commits
+that were applied, so of work already pushed, but a rewrite can hold new
+commits too, such as an amend's.
+
+`origin`'s rewrite refs are trusted as its records are: anyone who can push
+can change either.
 
 ## Lock timeout
 
@@ -321,13 +417,38 @@ Terraform themselves already refuse a saved plan whose state has moved on.
 mode, the call fails closed. If acquisition fails part-way, everything taken
 is released before reporting.
 
+## Upgrading from 0.1.0: `/alock:retrofit`
+
+alock 0.1.0 wrote records but no notes, so a rebase of a commit it applied
+isn't followed. `/alock:retrofit [-C <repository>]` notes those commits now:
+- **Which records:** every record in the clone, its own and, in remote mode,
+  `origin`'s, fetched first, whose commit has no `applied` note.
+- **What it notes:** each such commit, and every commit it brought, up to the
+  most recent 1,000, as an apply would. It skips the history of records that
+  already have their note.
+- **What it can't do:** git copies a note only while it rewrites a commit, so
+  a rewrite made before the retrofit stays unlinked. An apply over one is
+  refused, and the refusal says how to proceed.
+- **Where:** notes stay in the clone that writes them, so it's run once in
+  each clone whose agents rebase applied commits. Running it again notes
+  nothing new.
+
+It adds notes only to commits already applied, which can't let anything
+through that isn't applied content. Even so, like `/alock:break`, it's the
+user's command (`disable-model-invocation: true`), run as the skill's shell
+injection in the plugin's `libexec/`. Its output reaches the agent, which
+reports it. The SessionStart status names it whenever a record lacks its note.
+
 ## Hooks
 
 - **SessionStart** writes to `CLAUDE_ENV_FILE`:
   - `ALOCK_SESSION=<session_id>`, the identity in holder files;
   - `ALOCK_TIMEOUT`;
   - the plugin's `bin/` first on `PATH`, unless it already is, so the shims
-    come before the real binaries whatever order Claude Code adds them in.
+    come before the real binaries whatever order Claude Code adds them in;
+  - `refs/notes/alock` added to `GIT_NOTES_REWRITE_REF`, unless it's already
+    there, so rewrites carry alock's notes. Like any value of that variable,
+    it takes the place of `notes.rewriteRef` config in the session.
 
   It then reports on the mode:
   - **With the mode unset or invalid,** in every session while the plugin is
@@ -340,13 +461,21 @@ is released before reporting.
     should tell the user so.
   - **Otherwise,** it prints the mode, the held locks with their holders, and
     every target whose records this HEAD doesn't contain, fetching `origin`'s
-    first in remote mode.
+    first in remote mode. When a record has no note, it also asks the agent to
+    have the user run `/alock:retrofit`.
 - **PreToolUse (Bash)** denies, with a reason the agent sees:
   - calls naming the break script in the plugin's `libexec/`;
   - `git config` changing the `alock` section or any of its keys: setting,
     unsetting, renaming or removing them, or opening the editor. Reading them
     is allowed;
   - `git -c alock.…`, and `GIT_CONFIG_*` assignments naming `alock`;
+  - `git update-ref`, `push` or `fetch` naming `refs/alock…` or
+    `refs/notes/alock`, or sweeping them up with `--mirror` or a `refs/*`
+    refspec; `git notes` writing to alock's notes ref, chosen by `--ref`,
+    `GIT_NOTES_REF` (exported earlier in the command, too) or
+    `-c core.notesRef`; and `git config core.notesRef` naming it. Reading them
+    is allowed. Only the shims write records, notes and rewrite refs. A
+    `git update-ref --stdin` reads its refs from input the hook doesn't see;
   - calls to a real `tofu`, `terraform` or `ansible-playbook` by absolute path.
 - **PreToolUse (Edit, Write)** denies edits to git config files (a clone's
   `config` and `config.worktree`, `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`
@@ -379,6 +508,7 @@ mistakes, not against an agent set on getting around them.
   as a host's account on a directory server. Only the hosts are locked.
 - **Shells without the shims on `PATH`,** such as a human's own terminal,
   unless they put the plugin's `bin/` there themselves.
+- **Rewrites alock can't follow:** see Containment. They're refused.
 
 ## Implementation
 
@@ -388,9 +518,9 @@ needs Python on the machine that runs it.
 | Path | Contents |
 |---|---|
 | `bin/` | the `tofu`, `terraform` and `ansible-playbook` shims, and nothing else |
-| `libexec/shim.py`, `hook.py`, `break.py` | entry points for the shims, the hooks and `/alock:break` |
+| `libexec/shim.py`, `hook.py`, `break.py`, `retrofit.py` | entry points for the shims, the hooks, `/alock:break` and `/alock:retrofit` |
 | `libexec/alock/` | the shared code |
-| `skills/break/SKILL.md` | the `/alock:break` command |
+| `skills/break/SKILL.md`, `skills/retrofit/SKILL.md` | the `/alock:break` and `/alock:retrofit` commands |
 | `hooks/hooks.json` | the SessionStart and PreToolUse hooks |
 | `tests/` | end-to-end tests against stub binaries |
 
