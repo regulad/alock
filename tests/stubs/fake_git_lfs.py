@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A stand-in for `git lfs` lock, unlock and locks, keeping locks as
-directories under $FAKE_LFS_DIR. Tests point ALOCK_GIT_LFS at it."""
+directories under $FAKE_LFS_DIR. Tests point ALOCK_GIT_LFS at it.
+
+$FAKE_LFS_UNLOCK_WAIT names a file: an unlock takes effect at once, but its
+reply waits for that file to appear, as a slow network would hold it up."""
 
 import json
 import os
@@ -21,6 +24,13 @@ def all_locks():
         except (FileNotFoundError, ValueError):
             found.append({"id": "pending", "path": unquote(entry.name)})
     return found
+
+
+def hold_reply():
+    wait = os.environ.get("FAKE_LFS_UNLOCK_WAIT")
+    deadline = time.monotonic() + 30
+    while wait and not os.path.exists(wait) and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def main(args):
@@ -56,6 +66,7 @@ def main(args):
             if lock["id"] == lock_id:
                 (entry / "lock.json").unlink()
                 entry.rmdir()
+                hold_reply()
                 print(json.dumps([{"id": lock_id, "unlocked": True}]))
                 return 0
         print(f"Unable to unlock: no lock with id {lock_id}", file=sys.stderr)

@@ -65,7 +65,7 @@ def break_one(repo, target: str) -> str:
     if repo.mode == "local":
         backend = locks.LocalBackend(repo)
         if not backend.is_held(target):
-            locks.remove_holder(repo, target)
+            locks.remove_holder(repo, holder)
             return f"{target}: not locked. Nothing to break."
         return (
             f"{target}: held in local mode by {who}. A local lock lasts exactly as long as "
@@ -75,10 +75,10 @@ def break_one(repo, target: str) -> str:
     backend = locks.LfsBackend(repo)
     lock = backend.lock_for(target)
     if lock is None:
-        locks.remove_holder(repo, target)
+        locks.remove_holder(repo, holder)
         return f"{target}: not locked. Nothing to break."
     backend.release(str(lock["id"]), force=True)
-    locks.remove_holder(repo, target)
+    locks.remove_holder(repo, holder)
     owner = (lock.get("owner") or {}).get("name", "unknown")
     return (
         f"{target}: BROKEN. It was LFS lock {lock['id']}, owned by {owner} since "

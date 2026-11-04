@@ -194,6 +194,12 @@ The mode is the git config value `alock.mode`, in one of four states:
 - the machine, worktree, branch and command;
 - when the lock was taken, after any wait.
 
+A holder file is removed only while it still names the run it's removed for:
+the same shim pid and start time, taken at the same time. Once a lock is
+free, the next run can take it and write its own holder file before the last
+run removes its file. Writing a holder file and that check and removal take
+turns on a `flock` on `<common dir>/alock/held.lock`.
+
 A subagent carries its session's `ALOCK_SESSION`, so a holder file can't tell
 a subagent's run from its parent's. Their pids and commands still differ.
 
@@ -259,9 +265,10 @@ a subagent's run from its parent's. Their pids and commands still differ.
    - **Locks:** in local mode the child inherits the lock descriptors, so its
      locks last as long as it does, even if the shim is killed first.
 8. **Release every lock and delete its holder file** once the child has
-   exited, so this also happens on failure or interrupt. A lock that fails to
-   release keeps its holder file, so this machine's next run can release it
-   as an orphan.
+   exited, so this also happens on failure or interrupt. Each lock is
+   released before its holder file is removed. A run killed while releasing,
+   or a lock that fails to release, then still has its holder file, so this
+   machine's next run can release the lock as an orphan.
 
 **Exit codes.** A call alock refuses exits without running anything:
 - **75:** a lock stayed held past the timeout.

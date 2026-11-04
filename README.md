@@ -38,7 +38,7 @@ To have every session in a repository load it, commit this to the repository's
 {
   "extraKnownMarketplaces": {
     "alock": {
-      "source": { "source": "github", "repo": "regulad/alock", "ref": "alock--v0.2.0" }
+      "source": { "source": "github", "repo": "regulad/alock", "ref": "alock--v0.2.1" }
     }
   },
   "enabledPlugins": { "alock@alock": true }

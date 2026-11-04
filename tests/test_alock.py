@@ -122,10 +122,10 @@ class Lab:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
 
-    def wait_for_log(self, needle: str, timeout: float = 20) -> None:
+    def wait_for_log(self, needle: str, timeout: float = 20, count: int = 1) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if needle in self.log.read_text():
+            if self.log.read_text().count(needle) >= count:
                 return
             time.sleep(0.05)
         raise AssertionError(f"{needle!r} never appeared in the stub log:\n{self.log.read_text()}")
@@ -423,6 +423,29 @@ class AlockTest(unittest.TestCase):
         self.lab.wait_for_log("tofu apply")
         os.killpg(apply.pid, signal.SIGKILL)  # the shim and its child: a crash
         apply.wait()
+        result = self.lab.run(repo / "tofu/plain", "tofu", "apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_finishing_run_keeps_the_next_holders_file(self):
+        repo = self.lab.clone("a", mode="remote")
+        reply = self.lab.dir / "unlock-reply"
+        # The first run's unlock takes effect, but its reply is held up until
+        # the waiting run has taken the lock and started its child.
+        first = self.lab.start(
+            repo / "tofu/plain", "tofu", "apply",
+            env={"STUB_SLEEP": "1", "FAKE_LFS_UNLOCK_WAIT": str(reply)},
+        )
+        self.lab.wait_for_log("tofu apply")
+        second = self.lab.start(
+            repo / "tofu/plain", "tofu", "apply", env={"STUB_SLEEP": "30", "ALOCK_TIMEOUT": "20"}
+        )
+        self.lab.wait_for_log("tofu apply", count=2)
+        reply.touch()
+        self.assertEqual(first.wait(timeout=30), 0)
+        os.killpg(second.pid, signal.SIGKILL)  # the second run crashes
+        second.wait()
+        # Its holder file survived the first run's release, so its lock is
+        # recognised as an orphan here.
         result = self.lab.run(repo / "tofu/plain", "tofu", "apply")
         self.assertEqual(result.returncode, 0, result.stderr)
 

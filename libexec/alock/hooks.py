@@ -125,7 +125,7 @@ def status(repo: Repo) -> str:
                 if backend.is_held(holder.target):
                     held.append(f"  {holder.target}: {holder.describe()}")
                 else:
-                    locks.remove_holder(repo, holder.target)  # left by a finished run
+                    locks.remove_holder(repo, holder)  # left by a finished run
     except AlockError as e:
         lines.append(f"Couldn't read the locks: {e}")
     lines.append("Held locks:\n" + ("\n".join(held) if held else "  none"))

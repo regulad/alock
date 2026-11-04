@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fcntl
 import json
@@ -65,12 +66,23 @@ def holder_path(repo: Repo, target: str) -> Path:
     return repo.state_dir / "held" / f"{target_key(target)}.json"
 
 
+@contextlib.contextmanager
+def holder_files(repo: Repo):
+    """This clone's holder file writers and removers take turns, so a remover's
+    check of whose a file is still holds when it removes it."""
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    with open(repo.state_dir / "held.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def write_holder(repo: Repo, holder: Holder) -> None:
     path = holder_path(repo, holder.target)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(dataclasses.asdict(holder), indent=2) + "\n")
-    os.replace(tmp, path)
+    with holder_files(repo):
+        os.replace(tmp, path)
 
 
 def read_holder(repo: Repo, target: str) -> Holder | None:
@@ -81,8 +93,20 @@ def read_holder(repo: Repo, target: str) -> Holder | None:
         return None
 
 
-def remove_holder(repo: Repo, target: str) -> None:
-    holder_path(repo, target).unlink(missing_ok=True)
+def remove_holder(repo: Repo, holder: Holder | None) -> None:
+    """Remove holder's file, unless another run's has replaced it. Once a lock
+    is free, the next run can take it and write its own before this runs."""
+    if holder is None:
+        return
+    with holder_files(repo):
+        current = read_holder(repo, holder.target)
+        # The shim's pid entry, with its start time, is unique to one run.
+        if (
+            current is not None
+            and current.pids[:1] == holder.pids[:1]
+            and current.taken_at == holder.taken_at
+        ):
+            holder_path(repo, holder.target).unlink(missing_ok=True)
 
 
 def all_holders(repo: Repo) -> list[Holder]:
@@ -249,7 +273,7 @@ def release_orphan(repo: Repo, backend, target: str) -> bool:
     if lock is None or str(lock.get("id")) != holder.lfs_id:
         return False
     backend.release(holder.lfs_id)
-    remove_holder(repo, target)
+    remove_holder(repo, holder)
     return True
 
 
@@ -272,19 +296,23 @@ class Acquired:
         self.repo = repo
         self.backend = backend
         self.handles: dict[str, object] = {}
+        self.holders: dict[str, Holder] = {}
 
     def release_all(self) -> None:
         errors = []
         for target, handle in reversed(list(self.handles.items())):
+            # The holder file stays until the lock is released, so a run killed
+            # while releasing leaves one for this machine's next run: it finds
+            # the lock's pids dead and releases it as an orphan. The same holds
+            # when the release fails.
             try:
                 self.backend.release(handle)
             except AlockError as e:
-                # The holder file stays, so this machine's next run finds the
-                # lock's pids dead and releases it as an orphan.
                 errors.append(str(e))
                 continue
-            remove_holder(self.repo, target)
+            remove_holder(self.repo, self.holders.get(target))
         self.handles.clear()
+        self.holders.clear()
         if errors:
             raise AlockError("\n".join(errors))
 
@@ -304,15 +332,14 @@ def acquire(repo: Repo, backend, targets: list[str], holder_base: dict, timeout:
             while True:
                 handle = backend.try_acquire(target)
                 if handle is not None:
-                    acquired.handles[target] = handle
-                    write_holder(
-                        repo,
-                        Holder(
-                            **{**holder_base, "taken_at": now()},
-                            target=target,
-                            lfs_id=backend.lfs_id(handle),
-                        ),
+                    holder = Holder(
+                        **{**holder_base, "taken_at": now()},
+                        target=target,
+                        lfs_id=backend.lfs_id(handle),
                     )
+                    acquired.handles[target] = handle
+                    acquired.holders[target] = holder
+                    write_holder(repo, holder)
                     break
                 if release_orphan(repo, backend, target):
                     continue
