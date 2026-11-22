@@ -6,7 +6,8 @@ _extends: .github
 repository:
   name: alock
   description: >-
-    Claude Code plugin that locks OpenTofu, Terraform and Ansible applies so parallel agents can't overlap or undo each other
+    Claude Code plugin that locks OpenTofu, Terraform and Ansible applies so
+    parallel agents can't collide
   homepage: ""
   private: false
   # Topics: comma-and-space separated string, NOT a YAML list.
