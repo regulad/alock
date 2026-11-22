@@ -1,17 +1,16 @@
-# Repository settings, applied by the Probot "Settings" app.
-# https://github.com/repository-settings/app
+# Repository configuration, managed by the Settings app
+# (https://github.com/repository-settings/app). The shared defaults come from
+# regulad/.github; this file sets only what is this repository's own.
+_extends: .github
 
 repository:
   name: alock
-  description: "Claude Code plugin that locks OpenTofu, Terraform and Ansible applies so parallel agents can't overlap or undo each other"
-  topics: claude-code, claude-code-plugin, ai-agents, multi-agent, opentofu, terraform, ansible, infrastructure-as-code, locking, git-worktree, git-lfs
-
+  description: >-
+    Claude Code plugin that locks OpenTofu, Terraform and Ansible applies so parallel agents can't overlap or undo each other
+  homepage: ""
   private: false
-
-  has_issues: true
-  has_projects: false
-  has_wiki: false
-  has_downloads: false
-  has_discussions: false
-
+  # Topics: comma-and-space separated string, NOT a YAML list.
+  topics: claude-code, claude-code-plugin, ai-agents, multi-agent, opentofu, terraform, ansible, infrastructure-as-code, locking, git-worktree, git-lfs
   default_branch: master
+
+  has_downloads: false
